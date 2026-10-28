@@ -1,3 +1,3 @@
 # GridOptima ⚡
 
-Smart Grid Energy Optimization Using Greedy and Dynamic Programming with Streamlit GUI.
+Smart Grid Energy Optimization Using Greedy and Dynamic Programming.
