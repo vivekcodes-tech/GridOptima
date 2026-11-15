@@ -1,163 +1,167 @@
-"""
-GridOptima Optimization Core
-Implements:
-1. Baseline Scenario (Uncontrolled)
-2. Greedy Heuristic Scheduler
-3. Dynamic Programming Backward Induction Optimizer
-"""
-
+import time
 import numpy as np
 
 
 class BatterySpec:
     def __init__(
         self,
-        capacity_kwh=60.0,
-        max_charge_rate_kw=20.0,
-        max_discharge_rate_kw=20.0,
-        roundtrip_efficiency=0.92,
-        min_soc=0.10,
-        max_soc=0.95,
-        initial_soc=0.30,
+        capacity_kwh: float = 60.0,
+        max_power_kw: float = 20.0,
+        roundtrip_efficiency: float = 0.92,
+        min_soc: float = 0.10,
+        max_soc: float = 0.95,
+        initial_soc: float = 0.30,
     ):
         self.capacity_kwh = capacity_kwh
-        self.max_charge_rate_kw = max_charge_rate_kw
-        self.max_discharge_rate_kw = max_discharge_rate_kw
-        self.efficiency = roundtrip_efficiency
+        self.max_power_kw = max_power_kw
+        self.roundtrip_efficiency = roundtrip_efficiency
+        self.efficiency = np.sqrt(roundtrip_efficiency)
         self.min_soc = min_soc
         self.max_soc = max_soc
         self.initial_soc = initial_soc
 
 
-def run_baseline(demand, solar, tariffs, feed_in):
-    """
-    Baseline strategy: No battery intervention.
-    Excess solar is exported to the grid; energy deficits are directly purchased.
-    """
+def run_baseline(
+    demand: np.ndarray,
+    solar: np.ndarray,
+    tariffs: np.ndarray,
+    feed_in: np.ndarray,
+) -> dict:
+    t0 = time.perf_counter()
+
     grid_import = np.maximum(0.0, demand - solar)
     grid_export = np.maximum(0.0, solar - demand)
     hourly_cost = (grid_import * tariffs) - (grid_export * feed_in)
+
     return {
         "grid_import": grid_import,
         "grid_export": grid_export,
-        "hourly_cost": hourly_cost,
-        "total_cost": float(np.sum(hourly_cost)),
         "battery_soc": np.zeros(24),
         "battery_power": np.zeros(24),
+        "hourly_cost": hourly_cost,
+        "total_cost": float(np.sum(hourly_cost)),
+        "solve_time_ms": (time.perf_counter() - t0) * 1000.0,
     }
 
 
-def run_greedy(demand, solar, tariffs, feed_in, battery: BatterySpec):
-    """
-    Greedy Strategy:
-    - Excess solar -> Charge battery first, export remainder.
-    - Deficit -> If tariff is Peak or Normal, discharge battery to minimize expensive imports.
-    - If tariff is Off-peak, preserve battery or charge if solar is available.
-    """
-    soc = battery.initial_soc
-    battery_power = np.zeros(24)  # > 0 discharging, < 0 charging
+def run_greedy(
+    demand: np.ndarray,
+    solar: np.ndarray,
+    tariffs: np.ndarray,
+    feed_in: np.ndarray,
+    battery: BatterySpec,
+) -> dict:
+    t0 = time.perf_counter()
+
+    soc_history = np.zeros(24)
+    battery_power = np.zeros(24)
     grid_import = np.zeros(24)
     grid_export = np.zeros(24)
-    soc_history = np.zeros(24)
 
-    min_kwh = battery.min_soc * battery.capacity_kwh
-    max_kwh = battery.max_soc * battery.capacity_kwh
-    current_kwh = soc * battery.capacity_kwh
+    min_energy = battery.min_soc * battery.capacity_kwh
+    max_energy = battery.max_soc * battery.capacity_kwh
+    current_energy = battery.initial_soc * battery.capacity_kwh
+    eta = battery.efficiency
 
     for t in range(24):
-        net_energy = demand[t] - solar[t]
+        net_load = demand[t] - solar[t]
 
-        if net_energy < 0:
-            # Solar surplus: charge battery first
-            surplus = -net_energy
-            room_to_charge = (max_kwh - current_kwh) / battery.efficiency
-            charge_amount = min(surplus, battery.max_charge_rate_kw, room_to_charge)
-            current_kwh += charge_amount * battery.efficiency
-            battery_power[t] = -charge_amount
-            excess_export = surplus - charge_amount
-            grid_export[t] = excess_export
+        if net_load < 0:
+            surplus = -net_load
+            headroom = (max_energy - current_energy) / eta
+            charge_power = min(surplus, battery.max_power_kw, headroom)
+
+            current_energy += charge_power * eta
+            battery_power[t] = -charge_power
+            grid_export[t] = surplus - charge_power
             grid_import[t] = 0.0
         else:
-            # Energy deficit: discharge battery during peak hours (>= 7.5 INR)
-            deficit = net_energy
+            deficit = net_load
             if tariffs[t] >= 7.50:
-                available_discharge = (current_kwh - min_kwh) * battery.efficiency
-                discharge_amount = min(deficit, battery.max_discharge_rate_kw, available_discharge)
-                current_kwh -= discharge_amount / battery.efficiency
-                battery_power[t] = discharge_amount
-                remaining_deficit = deficit - discharge_amount
-                grid_import[t] = remaining_deficit
+                available = (current_energy - min_energy) * eta
+                discharge_power = min(deficit, battery.max_power_kw, available)
+
+                current_energy -= discharge_power / eta
+                battery_power[t] = discharge_power
+                grid_import[t] = deficit - discharge_power
             else:
                 grid_import[t] = deficit
+
             grid_export[t] = 0.0
 
-        soc_history[t] = current_kwh / battery.capacity_kwh
+        soc_history[t] = current_energy / battery.capacity_kwh
 
     hourly_cost = (grid_import * tariffs) - (grid_export * feed_in)
+
     return {
         "grid_import": grid_import,
         "grid_export": grid_export,
-        "hourly_cost": hourly_cost,
-        "total_cost": float(np.sum(hourly_cost)),
         "battery_soc": soc_history,
         "battery_power": battery_power,
+        "hourly_cost": hourly_cost,
+        "total_cost": float(np.sum(hourly_cost)),
+        "solve_time_ms": (time.perf_counter() - t0) * 1000.0,
     }
 
 
-def run_dynamic_programming(demand, solar, tariffs, feed_in, battery: BatterySpec, num_states=101):
-    """
-    Globally Optimal Energy Management via Bellman Dynamic Programming.
-    Discretizes State of Charge into 'num_states' grid points.
-    Solves backward in time (t=23 down to 0) and reconstructs optimal sequence.
-    """
-    soc_states = np.linspace(battery.min_soc, battery.max_soc, num_states)
-    kwh_states = soc_states * battery.capacity_kwh
+def run_dynamic_programming(
+    demand: np.ndarray,
+    solar: np.ndarray,
+    tariffs: np.ndarray,
+    feed_in: np.ndarray,
+    battery: BatterySpec,
+    num_states: int = 101,
+    enforce_cyclic: bool = True,
+) -> dict:
+    t0 = time.perf_counter()
 
-    # DP Table: V[t, state_index] stores min cost-to-go from stage t
+    soc_states = np.linspace(battery.min_soc, battery.max_soc, num_states)
+    energy_states = soc_states * battery.capacity_kwh
+    eta = battery.efficiency
+
     V = np.full((25, num_states), np.inf)
-    V[24, :] = 0.0  # Terminal boundary condition (no remaining cost)
+
+    if enforce_cyclic:
+        peak_rate = float(np.max(tariffs))
+        V[24, :] = np.where(
+            soc_states >= battery.initial_soc,
+            0.0,
+            (battery.initial_soc - soc_states) * battery.capacity_kwh * peak_rate,
+        )
+    else:
+        V[24, :] = 0.0
+
     policy = np.zeros((24, num_states), dtype=int)
 
-    # Backward Induction
     for t in range(23, -1, -1):
         net_load = demand[t] - solar[t]
-        c_tariff = tariffs[t]
-        c_feed = feed_in[t]
+        c_buy = tariffs[t]
+        c_sell = feed_in[t]
 
-        for i, s_from in enumerate(kwh_states):
-            # Delta battery kWh between consecutive stages
-            delta_e = kwh_states - s_from
+        for i, e_from in enumerate(energy_states):
+            delta_e = energy_states - e_from
 
-            # Charging branch (delta_e > 0)
-            charge_power = delta_e / battery.efficiency
-            valid_charge = (delta_e >= 0) & (charge_power <= battery.max_charge_rate_kw)
+            charge_power = delta_e / eta
+            valid_charge = (delta_e >= 0) & (charge_power <= battery.max_power_kw)
 
-            # Discharging branch (delta_e < 0)
-            discharge_power = -delta_e * battery.efficiency
-            valid_discharge = (delta_e < 0) & (discharge_power <= battery.max_discharge_rate_kw)
+            discharge_power = -delta_e * eta
+            valid_discharge = (delta_e < 0) & (discharge_power <= battery.max_power_kw)
 
             valid_actions = valid_charge | valid_discharge
 
-            # Stage Cost Calculation
-            # p_bat: positive = feeding load, negative = taking from system
             p_bat = np.where(delta_e >= 0, -charge_power, discharge_power)
             grid_exchange = net_load - p_bat
 
-            instant_cost = np.where(
-                grid_exchange >= 0,
-                grid_exchange * c_tariff,
-                grid_exchange * c_feed
-            )
+            stage_cost = np.where(grid_exchange >= 0, grid_exchange * c_buy, grid_exchange * c_sell)
+            path_cost = np.where(valid_actions, stage_cost + V[t + 1, :], np.inf)
 
-            total_path_cost = np.where(valid_actions, instant_cost + V[t + 1, :], np.inf)
-            best_idx = np.argmin(total_path_cost)
-
-            V[t, i] = total_path_cost[best_idx]
+            best_idx = np.argmin(path_cost)
+            V[t, i] = path_cost[best_idx]
             policy[t, i] = best_idx
 
-    # Forward Reconstruction from initial SoC
-    initial_idx = np.argmin(np.abs(soc_states - battery.initial_soc))
-    optimal_soc_history = np.zeros(24)
+    initial_idx = int(np.argmin(np.abs(soc_states - battery.initial_soc)))
+
+    optimal_soc = np.zeros(24)
     optimal_battery_power = np.zeros(24)
     grid_import = np.zeros(24)
     grid_export = np.zeros(24)
@@ -165,15 +169,15 @@ def run_dynamic_programming(demand, solar, tariffs, feed_in, battery: BatterySpe
     current_idx = initial_idx
     for t in range(24):
         next_idx = policy[t, current_idx]
-        delta_kwh = kwh_states[next_idx] - kwh_states[current_idx]
+        delta_e = energy_states[next_idx] - energy_states[current_idx]
 
-        if delta_kwh >= 0:
-            p_b = -(delta_kwh / battery.efficiency)
+        if delta_e >= 0:
+            p_b = -(delta_e / eta)
         else:
-            p_b = -delta_kwh * battery.efficiency
+            p_b = -delta_e * eta
 
         optimal_battery_power[t] = p_b
-        optimal_soc_history[t] = soc_states[next_idx]
+        optimal_soc[t] = soc_states[next_idx]
 
         net_exchange = (demand[t] - solar[t]) - p_b
         if net_exchange >= 0:
@@ -186,11 +190,18 @@ def run_dynamic_programming(demand, solar, tariffs, feed_in, battery: BatterySpe
         current_idx = next_idx
 
     hourly_cost = (grid_import * tariffs) - (grid_export * feed_in)
+
     return {
         "grid_import": grid_import,
         "grid_export": grid_export,
+        "battery_soc": optimal_soc,
+        "battery_power": optimal_battery_power,
         "hourly_cost": hourly_cost,
         "total_cost": float(np.sum(hourly_cost)),
-        "battery_soc": optimal_soc_history,
-        "battery_power": optimal_battery_power,
+        "solve_time_ms": (time.perf_counter() - t0) * 1000.0,
+        "dp_table_V": V,
+        "policy_table": policy,
+        "soc_states": soc_states,
+        "num_evaluations": 24 * (num_states ** 2),
+        "num_states": num_states,
     }
